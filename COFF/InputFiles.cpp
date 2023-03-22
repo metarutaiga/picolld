@@ -476,11 +476,6 @@ void ObjFile::handleComdatSelection(
   COMDATType leaderSelection = leaderChunk->selection;
 
   assert(leader->data && "Comdat leader without SectionChunk?");
-  if (isa<BitcodeFile>(leader->file)) {
-    // If the leader is only a LTO symbol, we don't know e.g. its final size
-    // yet, so we can't do the full strict comdat selection checking yet.
-    selection = leaderSelection = IMAGE_COMDAT_SELECT_ANY;
-  }
 
   if ((selection == IMAGE_COMDAT_SELECT_ANY &&
        leaderSelection == IMAGE_COMDAT_SELECT_LARGEST) ||
@@ -989,103 +984,6 @@ void ImportFile::parse() {
   if (hdr->getType() == llvm::COFF::IMPORT_CODE)
     thunkSym = ctx.symtab.addImportThunk(
         name, cast_or_null<DefinedImportData>(impSym), hdr->Machine);
-}
-
-BitcodeFile::BitcodeFile(COFFLinkerContext &ctx, MemoryBufferRef mb,
-                         StringRef archiveName, uint64_t offsetInArchive,
-                         bool lazy)
-    : InputFile(ctx, BitcodeKind, mb, lazy) {
-  std::string path = mb.getBufferIdentifier().str();
-  if (ctx.config.thinLTOIndexOnly)
-    path = replaceThinLTOSuffix(mb.getBufferIdentifier(),
-                                ctx.config.thinLTOObjectSuffixReplace.first,
-                                ctx.config.thinLTOObjectSuffixReplace.second);
-
-  // ThinLTO assumes that all MemoryBufferRefs given to it have a unique
-  // name. If two archives define two members with the same name, this
-  // causes a collision which result in only one of the objects being taken
-  // into consideration at LTO time (which very likely causes undefined
-  // symbols later in the link stage). So we append file offset to make
-  // filename unique.
-  MemoryBufferRef mbref(mb.getBuffer(),
-                        saver().save(archiveName.empty()
-                                         ? path
-                                         : archiveName +
-                                               sys::path::filename(path) +
-                                               utostr(offsetInArchive)));
-
-  obj = check(lto::InputFile::create(mbref));
-}
-
-BitcodeFile::~BitcodeFile() = default;
-
-void BitcodeFile::parse() {
-  llvm::StringSaver &saver = lld::saver();
-
-  std::vector<std::pair<Symbol *, bool>> comdat(obj->getComdatTable().size());
-  for (size_t i = 0; i != obj->getComdatTable().size(); ++i)
-    // FIXME: Check nodeduplicate
-    comdat[i] =
-        ctx.symtab.addComdat(this, saver.save(obj->getComdatTable()[i].first));
-  for (const lto::InputFile::Symbol &objSym : obj->symbols()) {
-    StringRef symName = saver.save(objSym.getName());
-    int comdatIndex = objSym.getComdatIndex();
-    Symbol *sym;
-    SectionChunk *fakeSC = nullptr;
-    if (objSym.isExecutable())
-      fakeSC = &ctx.ltoTextSectionChunk.chunk;
-    else
-      fakeSC = &ctx.ltoDataSectionChunk.chunk;
-    if (objSym.isUndefined()) {
-      sym = ctx.symtab.addUndefined(symName, this, false);
-    } else if (objSym.isCommon()) {
-      sym = ctx.symtab.addCommon(this, symName, objSym.getCommonSize());
-    } else if (objSym.isWeak() && objSym.isIndirect()) {
-      // Weak external.
-      sym = ctx.symtab.addUndefined(symName, this, true);
-      std::string fallback = std::string(objSym.getCOFFWeakExternalFallback());
-      Symbol *alias = ctx.symtab.addUndefined(saver.save(fallback));
-      checkAndSetWeakAlias(ctx, this, sym, alias);
-    } else if (comdatIndex != -1) {
-      if (symName == obj->getComdatTable()[comdatIndex].first) {
-        sym = comdat[comdatIndex].first;
-        if (cast<DefinedRegular>(sym)->data == nullptr)
-          cast<DefinedRegular>(sym)->data = &fakeSC->repl;
-      } else if (comdat[comdatIndex].second) {
-        sym = ctx.symtab.addRegular(this, symName, nullptr, fakeSC);
-      } else {
-        sym = ctx.symtab.addUndefined(symName, this, false);
-      }
-    } else {
-      sym = ctx.symtab.addRegular(this, symName, nullptr, fakeSC, 0,
-                                  objSym.isWeak());
-    }
-    symbols.push_back(sym);
-    if (objSym.isUsed())
-      ctx.config.gcroot.push_back(sym);
-  }
-  directives = obj->getCOFFLinkerOpts();
-}
-
-void BitcodeFile::parseLazy() {
-  for (const lto::InputFile::Symbol &sym : obj->symbols())
-    if (!sym.isUndefined())
-      ctx.symtab.addLazyObject(this, sym.getName());
-}
-
-MachineTypes BitcodeFile::getMachineType() {
-  switch (Triple(obj->getTargetTriple()).getArch()) {
-  case Triple::x86_64:
-    return AMD64;
-  case Triple::x86:
-    return I386;
-  case Triple::arm:
-    return ARMNT;
-  case Triple::aarch64:
-    return ARM64;
-  default:
-    return IMAGE_FILE_MACHINE_UNKNOWN;
-  }
 }
 
 std::string lld::coff::replaceThinLTOSuffix(StringRef path, StringRef suffix,

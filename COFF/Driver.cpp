@@ -203,9 +203,6 @@ void LinkerDriver::addBuffer(std::unique_ptr<MemoryBuffer> mb,
     }
     ctx.symtab.addFile(make<ArchiveFile>(ctx, mbref));
     break;
-  case file_magic::bitcode:
-    ctx.symtab.addFile(make<BitcodeFile>(ctx, mbref, "", 0, lazy));
-    break;
   case file_magic::coff_object:
   case file_magic::coff_import_library:
     ctx.symtab.addFile(make<ObjFile>(ctx, mbref, lazy));
@@ -271,9 +268,6 @@ void LinkerDriver::addArchiveBuffer(MemoryBufferRef mb, StringRef symName,
   InputFile *obj;
   if (magic == file_magic::coff_object) {
     obj = make<ObjFile>(ctx, mb);
-  } else if (magic == file_magic::bitcode) {
-    obj =
-        make<BitcodeFile>(ctx, mb, parentName, offsetInArchive, /*lazy=*/false);
   } else if (magic == file_magic::coff_cl_gl_object) {
     error(mb.getBufferIdentifier() +
           ": is not a native COFF file. Recompile without /GL?");
@@ -1405,13 +1399,6 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   ScopedTimer rootTimer(ctx.rootTimer);
   Configuration *config = &ctx.config;
 
-  // Needed for LTO.
-  InitializeAllTargetInfos();
-  InitializeAllTargets();
-  InitializeAllTargetMCs();
-  InitializeAllAsmParsers();
-  InitializeAllAsmPrinters();
-
   // If the first command line argument is "/lib", link.exe acts like lib.exe.
   // We call our own implementation of lib.exe that understands bitcode files.
   if (argsArr.size() > 1 &&
@@ -2243,15 +2230,6 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
           u->weakAlias = ctx.symtab.addUndefined(to);
     }
 
-    // If any inputs are bitcode files, the LTO code generator may create
-    // references to library functions that are not explicit in the bitcode
-    // file's symbol table. If any of those library functions are defined in a
-    // bitcode file in an archive member, we need to arrange to use LTO to
-    // compile those archive members by adding them to the link beforehand.
-    if (!ctx.bitcodeFileInstances.empty())
-      for (auto *s : lto::LTO::getRuntimeLibcallSymbols())
-        ctx.symtab.addLibcall(s);
-
     // Windows specific -- if __load_config_used can be resolved, resolve it.
     if (ctx.symtab.findUnderscore("_load_config_used"))
       addUndefined(mangle("_load_config_used"));
@@ -2310,11 +2288,6 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     // are chosen to be exported.
     maybeExportMinGWSymbols(args);
   }
-
-  // Do LTO by compiling bitcode input files to a set of native COFF files then
-  // link those files (unless -thinlto-index-only was given, in which case we
-  // resolve symbols and write indices, but don't generate native code or link).
-  ctx.symtab.compileBitcodeFiles();
 
   // If -thinlto-index-only is given, we should create only "index
   // files" and not object files. Index file creation is already done

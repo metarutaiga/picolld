@@ -133,7 +133,6 @@ private:
   std::vector<Symbol *> getSymsWithPrefix(StringRef prefix);
 
   llvm::DenseMap<llvm::CachedHashStringRef, Symbol *> symMap;
-  std::unique_ptr<BitcodeCompiler> lto;
 
   COFFLinkerContext &ctx;
 };

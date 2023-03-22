@@ -37,16 +37,11 @@ StringRef ltrim1(StringRef s, const char *chars) {
 void SymbolTable::addFile(InputFile *file) {
   log("Reading " + toString(file));
   if (file->lazy) {
-    if (auto *f = dyn_cast<BitcodeFile>(file))
-      f->parseLazy();
-    else
-      cast<ObjFile>(file)->parseLazy();
+    cast<ObjFile>(file)->parseLazy();
   } else {
     file->parse();
     if (auto *f = dyn_cast<ObjFile>(file)) {
       ctx.objFileInstances.push_back(f);
-    } else if (auto *f = dyn_cast<BitcodeFile>(file)) {
-      ctx.bitcodeFileInstances.push_back(f);
     } else if (auto *f = dyn_cast<ImportFile>(file)) {
       ctx.importFileInstances.push_back(f);
     }
@@ -214,13 +209,6 @@ static std::pair<std::vector<std::string>, size_t>
 getSymbolLocations(InputFile *file, uint32_t symIndex, size_t maxStrings) {
   if (auto *o = dyn_cast<ObjFile>(file))
     return getSymbolLocations(o, symIndex, maxStrings);
-  if (auto *b = dyn_cast<BitcodeFile>(file)) {
-    std::vector<std::string> symbolLocations = getSymbolLocations(b);
-    size_t numLocations = symbolLocations.size();
-    if (symbolLocations.size() > maxStrings)
-      symbolLocations.resize(maxStrings);
-    return std::make_pair(symbolLocations, numLocations);
-  }
   llvm_unreachable("unsupported file type passed to getSymbolLocations");
   return std::make_pair(std::vector<std::string>(), (size_t)0);
 }
@@ -423,10 +411,6 @@ static void reportProblemSymbols(
   for (ObjFile *file : ctx.objFileInstances)
     processFile(file, file->getSymbols());
 
-  if (needBitcodeFiles)
-    for (BitcodeFile *file : ctx.bitcodeFileInstances)
-      processFile(file, file->getSymbols());
-
   for (const UndefinedDiag &undefDiag : undefDiags)
     reportUndefinedSymbol(ctx, undefDiag);
 }
@@ -535,7 +519,7 @@ std::pair<Symbol *, bool> SymbolTable::insert(StringRef name) {
 
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef name, InputFile *file) {
   std::pair<Symbol *, bool> result = insert(name);
-  if (!file || !isa<BitcodeFile>(file))
+  if (!file)
     result.first->isUsedInRegularObj = true;
   return result;
 }
@@ -627,8 +611,6 @@ static std::string getSourceLocation(InputFile *file, SectionChunk *sc,
     return "";
   if (auto *o = dyn_cast<ObjFile>(file))
     return getSourceLocationObj(o, sc, offset, name);
-  if (auto *b = dyn_cast<BitcodeFile>(file))
-    return getSourceLocationBitcode(b);
   return "\n>>> defined at " + toString(file);
 }
 
@@ -862,16 +844,6 @@ Symbol *SymbolTable::addUndefined(StringRef name) {
 void SymbolTable::compileBitcodeFiles() {
   if (ctx.bitcodeFileInstances.empty())
     return;
-
-  ScopedTimer t(ctx.ltoTimer);
-  lto.reset(new BitcodeCompiler(ctx));
-  for (BitcodeFile *f : ctx.bitcodeFileInstances)
-    lto->add(*f);
-  for (InputFile *newObj : lto->compile()) {
-    ObjFile *obj = cast<ObjFile>(newObj);
-    obj->parse();
-    ctx.objFileInstances.push_back(obj);
-  }
 }
 
 } // namespace lld::coff

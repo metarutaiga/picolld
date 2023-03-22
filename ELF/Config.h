@@ -120,7 +120,6 @@ private:
   // True if we are in --start-lib and --end-lib.
   bool inLib = false;
 
-  std::unique_ptr<BitcodeCompiler> lto;
   std::vector<InputFile *> files;
 
 public:

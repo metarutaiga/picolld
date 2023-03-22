@@ -217,7 +217,7 @@ std::optional<MemoryBufferRef> elf::readFile(StringRef path) {
 // (e.g. it does not make sense to link x86 object files with
 // MIPS object files.) This function checks for that error.
 static bool isCompatible(InputFile *file) {
-  if (!file->isElf() && !isa<BitcodeFile>(file))
+  if (!file->isElf())
     return true;
 
   if (file->ekind == config->ekind && file->emachine == config->emachine) {
@@ -239,8 +239,6 @@ static bool isCompatible(InputFile *file) {
     existing = ctx.objectFiles[0];
   else if (!ctx.sharedFiles.empty())
     existing = ctx.sharedFiles[0];
-  else if (!ctx.bitcodeFiles.empty())
-    existing = ctx.bitcodeFiles[0];
   std::string with;
   if (existing)
     with = " with " + toString(existing);
@@ -261,12 +259,7 @@ template <class ELFT> static void doParseFile(InputFile *file) {
 
   // Lazy object file
   if (file->lazy) {
-    if (auto *f = dyn_cast<BitcodeFile>(file)) {
-      ctx.lazyBitcodeFiles.push_back(f);
-      f->parseLazy();
-    } else {
-      cast<ObjFile<ELFT>>(file)->parseLazy();
-    }
+    cast<ObjFile<ELFT>>(file)->parseLazy();
     return;
   }
 
@@ -276,13 +269,6 @@ template <class ELFT> static void doParseFile(InputFile *file) {
   // .so file
   if (auto *f = dyn_cast<SharedFile>(file)) {
     f->parse<ELFT>();
-    return;
-  }
-
-  // LLVM bitcode file
-  if (auto *f = dyn_cast<BitcodeFile>(file)) {
-    ctx.bitcodeFiles.push_back(f);
-    f->parse();
     return;
   }
 
@@ -1574,36 +1560,6 @@ static uint8_t getOsAbi(const Triple &t) {
   }
 }
 
-BitcodeFile::BitcodeFile(MemoryBufferRef mb, StringRef archiveName,
-                         uint64_t offsetInArchive, bool lazy)
-    : InputFile(BitcodeKind, mb) {
-  this->archiveName = archiveName;
-  this->lazy = lazy;
-
-  std::string path = mb.getBufferIdentifier().str();
-  if (config->thinLTOIndexOnly)
-    path = replaceThinLTOSuffix(mb.getBufferIdentifier());
-
-  // ThinLTO assumes that all MemoryBufferRefs given to it have a unique
-  // name. If two archives define two members with the same name, this
-  // causes a collision which result in only one of the objects being taken
-  // into consideration at LTO time (which very likely causes undefined
-  // symbols later in the link stage). So we append file offset to make
-  // filename unique.
-  StringRef name = archiveName.empty()
-                       ? saver().save(path)
-                       : saver().save(archiveName + "(" + path::filename(path) +
-                                      " at " + utostr(offsetInArchive) + ")");
-  MemoryBufferRef mbref(mb.getBuffer(), name);
-
-  obj = CHECK(lto::InputFile::create(mbref), this);
-
-  Triple t(obj->getTargetTriple());
-  ekind = getBitcodeELFKind(t);
-  emachine = getBitcodeMachineKind(mb.getBufferIdentifier(), t);
-  osabi = getOsAbi(t);
-}
-
 static uint8_t mapVisibility(GlobalValue::VisibilityTypes gvVisibility) {
   switch (gvVisibility) {
   case GlobalValue::DefaultVisibility:
@@ -1614,85 +1570,6 @@ static uint8_t mapVisibility(GlobalValue::VisibilityTypes gvVisibility) {
     return STV_PROTECTED;
   }
   llvm_unreachable("unknown visibility");
-}
-
-static void
-createBitcodeSymbol(Symbol *&sym, const std::vector<bool> &keptComdats,
-                    const lto::InputFile::Symbol &objSym, BitcodeFile &f) {
-  uint8_t binding = objSym.isWeak() ? STB_WEAK : STB_GLOBAL;
-  uint8_t type = objSym.isTLS() ? STT_TLS : STT_NOTYPE;
-  uint8_t visibility = mapVisibility(objSym.getVisibility());
-
-  if (!sym)
-    sym = symtab.insert(saver().save(objSym.getName()));
-
-  int c = objSym.getComdatIndex();
-  if (objSym.isUndefined() || (c != -1 && !keptComdats[c])) {
-    Undefined newSym(&f, StringRef(), binding, visibility, type);
-    sym->resolve(newSym);
-    sym->referenced = true;
-    return;
-  }
-
-  if (objSym.isCommon()) {
-    sym->resolve(CommonSymbol{&f, StringRef(), binding, visibility, STT_OBJECT,
-                              objSym.getCommonAlignment(),
-                              objSym.getCommonSize()});
-  } else {
-    Defined newSym(&f, StringRef(), binding, visibility, type, 0, 0, nullptr);
-    if (objSym.canBeOmittedFromSymbolTable())
-      newSym.exportDynamic = false;
-    sym->resolve(newSym);
-  }
-}
-
-void BitcodeFile::parse() {
-  for (std::pair<StringRef, Comdat::SelectionKind> s : obj->getComdatTable()) {
-    keptComdats.push_back(
-        s.second == Comdat::NoDeduplicate ||
-        symtab.comdatGroups.try_emplace(CachedHashStringRef(s.first), this)
-            .second);
-  }
-
-  if (numSymbols == 0) {
-    numSymbols = obj->symbols().size();
-    symbols = std::make_unique<Symbol *[]>(numSymbols);
-  }
-  // Process defined symbols first. See the comment in
-  // ObjFile<ELFT>::initializeSymbols.
-  for (auto [i, irSym] : llvm::enumerate(obj->symbols()))
-    if (!irSym.isUndefined())
-      createBitcodeSymbol(symbols[i], keptComdats, irSym, *this);
-  for (auto [i, irSym] : llvm::enumerate(obj->symbols()))
-    if (irSym.isUndefined())
-      createBitcodeSymbol(symbols[i], keptComdats, irSym, *this);
-
-  for (auto l : obj->getDependentLibraries())
-    addDependentLibrary(l, this);
-}
-
-void BitcodeFile::parseLazy() {
-  numSymbols = obj->symbols().size();
-  symbols = std::make_unique<Symbol *[]>(numSymbols);
-  for (auto [i, irSym] : llvm::enumerate(obj->symbols()))
-    if (!irSym.isUndefined()) {
-      auto *sym = symtab.insert(saver().save(irSym.getName()));
-      sym->resolve(LazyObject{*this});
-      symbols[i] = sym;
-    }
-}
-
-void BitcodeFile::postParse() {
-  for (auto [i, irSym] : llvm::enumerate(obj->symbols())) {
-    const Symbol &sym = *symbols[i];
-    if (sym.file == this || !sym.isDefined() || irSym.isUndefined() ||
-        irSym.isCommon() || irSym.isWeak())
-      continue;
-    int c = irSym.getComdatIndex();
-    if (c != -1 && !keptComdats[c])
-      continue;
-    reportDuplicate(sym, this, nullptr, 0);
-  }
 }
 
 void BinaryFile::parse() {
@@ -1766,9 +1643,6 @@ template <class ELFT> void ObjFile<ELFT>::parseLazy() {
 }
 
 bool InputFile::shouldExtractForCommon(StringRef name) {
-  if (isa<BitcodeFile>(this))
-    return isBitcodeNonCommonDef(mb, name, archiveName);
-
   return isNonCommonDef(mb, name, archiveName);
 }
 

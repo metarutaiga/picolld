@@ -246,10 +246,7 @@ void LinkerDriver::addFile(StringRef path, bool withLOption) {
     auto members = getArchiveMembers(mbref);
     if (inWholeArchive) {
       for (const std::pair<MemoryBufferRef, uint64_t> &p : members) {
-        if (isBitcode(p.first))
-          files.push_back(make<BitcodeFile>(p.first, path, p.second, false));
-        else
-          files.push_back(createObjFile(p.first, path));
+        files.push_back(createObjFile(p.first, path));
       }
       return;
     }
@@ -274,8 +271,6 @@ void LinkerDriver::addFile(StringRef path, bool withLOption) {
       auto magic = identify_magic(p.first.getBuffer());
       if (magic == file_magic::elf_relocatable)
         files.push_back(createObjFile(p.first, path, true));
-      else if (magic == file_magic::bitcode)
-        files.push_back(make<BitcodeFile>(p.first, path, p.second, true));
       else
         warn(path + ": archive member '" + p.first.getBufferIdentifier() +
              "' is neither ET_REL nor LLVM bitcode");
@@ -302,9 +297,6 @@ void LinkerDriver::addFile(StringRef path, bool withLOption) {
     files.push_back(f);
     return;
   }
-  case file_magic::bitcode:
-    files.push_back(make<BitcodeFile>(mbref, "", 0, inLib));
-    break;
   case file_magic::elf_relocatable:
     files.push_back(createObjFile(mbref, "", inLib));
     break;
@@ -607,7 +599,6 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   {
     llvm::TimeTraceScope timeScope("ExecuteLinker");
 
-    initLLVM();
     createFiles(args);
     if (errorCount())
       return;
@@ -1818,9 +1809,6 @@ static void excludeLibs(opt::InputArgList &args) {
 
   for (ELFFileBase *file : ctx.objectFiles)
     visit(file);
-
-  for (BitcodeFile *file : ctx.bitcodeFiles)
-    visit(file);
 }
 
 // Force Sym to be entered in the output.
@@ -1886,9 +1874,6 @@ static void writeArchiveStats() {
   SmallVector<StringRef, 0> archives;
   DenseMap<CachedHashStringRef, unsigned> all, extracted;
   for (ELFFileBase *file : ctx.objectFiles)
-    if (file->archiveName.size())
-      ++extracted[CachedHashStringRef(file->archiveName)];
-  for (BitcodeFile *file : ctx.bitcodeFiles)
     if (file->archiveName.size())
       ++extracted[CachedHashStringRef(file->archiveName)];
   for (std::pair<StringRef, unsigned> f : ctx.driver.archiveFiles) {
@@ -2180,44 +2165,9 @@ static void markBuffersAsDontNeed(bool skipLinkedOutput) {
 
   // Otherwise, just mark MemoryBuffers backing BitcodeFiles.
   DenseSet<const char *> bufs;
-  for (BitcodeFile *file : ctx.bitcodeFiles)
-    bufs.insert(file->mb.getBufferStart());
-  for (BitcodeFile *file : ctx.lazyBitcodeFiles)
-    bufs.insert(file->mb.getBufferStart());
   for (MemoryBuffer &mb : llvm::make_pointee_range(ctx.memoryBuffers))
     if (bufs.count(mb.getBufferStart()))
       mb.dontNeedIfMmap();
-}
-
-// This function is where all the optimizations of link-time
-// optimization takes place. When LTO is in use, some input files are
-// not in native object file format but in the LLVM bitcode format.
-// This function compiles bitcode files into a few big native files
-// using LLVM functions and replaces bitcode symbols with the results.
-// Because all bitcode files that the program consists of are passed to
-// the compiler at once, it can do a whole-program optimization.
-template <class ELFT>
-void LinkerDriver::compileBitcodeFiles(bool skipLinkedOutput) {
-  llvm::TimeTraceScope timeScope("LTO");
-  // Compile bitcode files and replace bitcode symbols.
-  lto.reset(new BitcodeCompiler);
-  for (BitcodeFile *file : ctx.bitcodeFiles)
-    lto->add(*file);
-
-  if (!ctx.bitcodeFiles.empty())
-    markBuffersAsDontNeed(skipLinkedOutput);
-
-  for (InputFile *file : lto->compile()) {
-    auto *obj = cast<ObjFile<ELFT>>(file);
-    obj->parse(/*ignoreComdats=*/true);
-
-    // Parse '@' in symbol names for non-relocatable output.
-    if (!config->relocatable)
-      for (Symbol *sym : obj->getGlobalSymbols())
-        if (sym->hasVersionSuffix)
-          sym->parseSymbolVersion();
-    ctx.objectFiles.push_back(obj);
-  }
 }
 
 // The --wrap option is a feature to rename symbols so that you can write
@@ -2576,27 +2526,6 @@ void LinkerDriver::link(opt::InputArgList &args) {
   if (Symbol *sym = dyn_cast_or_null<Defined>(symtab.find(config->fini)))
     sym->isUsedInRegularObj = true;
 
-  // If any of our inputs are bitcode files, the LTO code generator may create
-  // references to certain library functions that might not be explicit in the
-  // bitcode file's symbol table. If any of those library functions are defined
-  // in a bitcode file in an archive member, we need to arrange to use LTO to
-  // compile those archive members by adding them to the link beforehand.
-  //
-  // However, adding all libcall symbols to the link can have undesired
-  // consequences. For example, the libgcc implementation of
-  // __sync_val_compare_and_swap_8 on 32-bit ARM pulls in an .init_array entry
-  // that aborts the program if the Linux kernel does not support 64-bit
-  // atomics, which would prevent the program from running even if it does not
-  // use 64-bit atomics.
-  //
-  // Therefore, we only add libcall symbols to the link before LTO if we have
-  // to, i.e. if the symbol's definition is in bitcode. Any other required
-  // libcall symbols will be added to the link after LTO when we add the LTO
-  // object file to the link.
-  if (!ctx.bitcodeFiles.empty())
-    for (auto *s : lto::LTO::getRuntimeLibcallSymbols())
-      handleLibcall(s);
-
   // Archive members defining __wrap symbols may be extracted.
   std::vector<WrappedSymbol> wrapped = addWrappedSymbols(args);
 
@@ -2606,8 +2535,6 @@ void LinkerDriver::link(opt::InputArgList &args) {
     initSectionsAndLocalSyms(file, /*ignoreComdats=*/false);
   });
   parallelForEach(ctx.objectFiles, postParseObjectFile);
-  parallelForEach(ctx.bitcodeFiles,
-                  [](BitcodeFile *file) { file->postParse(); });
   for (auto &it : ctx.nonPrevailingSyms) {
     Symbol &sym = *it.first;
     Undefined(sym.file, sym.getName(), sym.binding, sym.stOther, sym.type,
@@ -2672,7 +2599,6 @@ void LinkerDriver::link(opt::InputArgList &args) {
   // With this the symbol table should be complete. After this, no new names
   // except a few linker-synthesized ones will be added to the symbol table.
   const size_t numObjsBeforeLTO = ctx.objectFiles.size();
-  invokeELFT(compileBitcodeFiles, skipLinkedOutput);
 
   // Symbol resolution finished. Report backward reference problems,
   // --print-archive-stats=, and --why-extract=.
