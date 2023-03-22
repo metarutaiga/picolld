@@ -519,8 +519,7 @@ std::pair<Symbol *, bool> SymbolTable::insert(StringRef name) {
 
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef name, InputFile *file) {
   std::pair<Symbol *, bool> result = insert(name);
-  if (!file)
-    result.first->isUsedInRegularObj = true;
+  result.first->isUsedInRegularObj = true;
   return result;
 }
 
